@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=35inch-qt
+GenericName=Controle do display USB 3.5"
+Comment=Painel de sistema, relógio e imagens no display USB de 3.5 polegadas (UsbMonitor)
+Exec=usbmonitor-qt
+Icon=35inch-qt
+Terminal=false
+Categories=Utility;System;Monitor;
+Keywords=display;usb;monitor;lcd;

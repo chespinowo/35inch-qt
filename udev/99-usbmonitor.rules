@@ -1,0 +1,13 @@
+# Acesso ao display USB de 3.5" "UsbMonitor" (QinHeng 1a86:5722) sem precisar de root.
+#
+# Instalação:
+#   sudo cp udev/99-usbmonitor.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# Depois, desconecte e conecte o display de novo.
+
+# Dá acesso ao usuário logado (uaccess) e ao grupo "dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5722", TAG+="uaccess", MODE="0660", GROUP="dialout"
+
+# Impede o ModemManager de "sondar" o display como se fosse um modem
+SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{idProduct}=="5722", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5722", ENV{ID_MM_DEVICE_IGNORE}="1"
