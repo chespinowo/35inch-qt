@@ -3,32 +3,41 @@
 from __future__ import annotations
 
 import json
+import time as _time
 from datetime import datetime
+from datetime import time as dtime
 
-from PySide6.QtCore import QMetaObject, QRectF, QSettings, QSize, Qt, QThread, QTimer
+from PySide6.QtCore import QMetaObject, QRectF, QSettings, QSize, Qt, QThread, QTime, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSpinBox,
     QStackedWidget,
     QTabWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from . import APP_TITLE
+from . import APP_TITLE, autostart, postfx
 from .device import PORT_AUTO, PORT_SIMULATOR, list_ports
 from .protocol import USB_PID, USB_VID, Orientation, oriented_size
 from .scenes import SCENE_CLASSES, RenderContext
+from .schedule import carousel_pick, night_active, parse_hhmm
 from .sysinfo import SystemStats
-from .theme import app_icon
+from .theme import STATUS_COLORS, app_icon
+from .tray import TrayController
 from .widgets import Card, SliderRow
 from .worker import DisplayWorker
 
@@ -38,8 +47,22 @@ ORIENTATION_LABELS = [
     (Orientation.LANDSCAPE, "Paisagem · 480×320"),
     (Orientation.REVERSE_LANDSCAPE, "Paisagem invertida"),
 ]
-
-DOT = {"ok": "#34d399", "wait": "#fbbf24", "off": "#6b7686", "err": "#f87171"}
+AUTOSTART_OPTIONS = [
+    ("off", "Desativado"),
+    ("login", "Ao entrar na sessão — janela na bandeja"),
+    ("service", "Serviço em segundo plano — sem janela, reinicia sozinho"),
+]
+AUTOSTART_TEXT = {
+    "off": "O aplicativo só roda quando você o abre.",
+    "login": "O aplicativo abre minimizado na bandeja ao entrar na sessão.",
+    "service": "Serviço systemd de usuário ativo: mantém o display atualizado sem janela.",
+}
+EXIT_OPTIONS = [
+    ("keep", "Manter a última imagem"),
+    ("clear", "Limpar a tela"),
+    ("off", "Desligar a tela"),
+]
+CAROUSEL_HOLD_SECONDS = 15  # ao mexer numa cena, a rotação espera para você ver o resultado
 
 
 class PreviewWidget(QWidget):
@@ -83,14 +106,61 @@ def _label(text: str, name: str = "") -> QLabel:
     return label
 
 
+def _checkbox(text: str, checked: bool, slot) -> QCheckBox:
+    box = QCheckBox(text)
+    box.setChecked(checked)
+    box.toggled.connect(slot)
+    return box
+
+
+def _combo(options: list[tuple[str, str]], current: str, slot) -> QComboBox:
+    combo = QComboBox()
+    for value, text in options:
+        combo.addItem(text, value)
+    combo.setCurrentIndex(max(0, combo.findData(current)))
+    combo.currentIndexChanged.connect(slot)
+    return combo
+
+
+def _select_silently(combo: QComboBox, value) -> None:
+    combo.blockSignals(True)
+    combo.setCurrentIndex(max(0, combo.findData(value)))
+    combo.blockSignals(False)
+
+
+def _scrollable(body: QWidget) -> QScrollArea:
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(body)
+    return area
+
+
+def _time_edit(text: str, fallback: dtime, slot) -> QTimeEdit:
+    t = parse_hhmm(text, fallback)
+    edit = QTimeEdit(QTime(t.hour, t.minute))
+    edit.setDisplayFormat("HH:mm")
+    edit.timeChanged.connect(slot)
+    return edit
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, simulate: bool = False, port: str | None = None) -> None:
+    def __init__(self, simulate: bool = False, port: str | None = None, service_mode: bool = False) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(app_icon())
         self.setMinimumSize(1000, 660)
         self.settings = QSettings("35inch-qt", "usbmonitor-qt")
         s = self.settings
+        self.service_mode = service_mode  # --headless: sem janela, sem bandeja, sempre reconecta
+        self.quit_on_close = False  # o app.py liga; nos testes a janela fecha sem encerrar o Qt
+        self._quitting = False
+        self._shut = False
+        self._now = datetime.now  # trocável nos testes
+        self.autostart_runner = autostart.default_runner
+        self._autostart_loaded = False
+        self._autostart_mode = "off"
         self.stats = SystemStats()
 
         self.orientation = Orientation(s.value("display/orientation", 0, type=int))
@@ -99,10 +169,31 @@ class MainWindow(QMainWindow):
         self.send_enabled = True
         self.partial = s.value("display/partial", True, type=bool)
         self.invert_brightness = s.value("display/invert_brightness", False, type=bool)
+        self.warmth = s.value("display/warmth", 0, type=int)
+        self.mirror_h = s.value("display/mirror_h", False, type=bool)
+        self.mirror_v = s.value("display/mirror_v", False, type=bool)
+        self.night_enabled = s.value("night/enabled", False, type=bool)
+        self.night_start = s.value("night/start", "22:00", type=str)
+        self.night_end = s.value("night/end", "07:00", type=str)
+        self.night_mode = s.value("night/mode", "dim", type=str)
+        self.night_brightness = s.value("night/brightness", 15, type=int)
+        self._night_state = "day"  # "day" | "dim" | "off"
+        self.carousel_enabled = s.value("carousel/enabled", False, type=bool)
+        self.carousel_interval = s.value("carousel/interval", 10, type=int)
+        raw_keys = s.value("carousel/scenes", "dashboard,clock", type=str)
+        self.carousel_keys = [k for k in raw_keys.split(",") if k]
+        self._carousel_t0 = _time.monotonic()
+        self._carousel_hold_until = 0.0
+        self.exit_action = s.value("exit/action", "keep", type=str)
+        self.tray_enabled = s.value("system/tray_enabled", True, type=bool)
+        self.close_to_tray = s.value("system/close_to_tray", True, type=bool)
+        self._tray_hint_shown = False
+
         self._connected = False
         self._connecting = False
         self._want_connected = False
         self._last_log = ""
+        self._info = ""
         self._startup_port = PORT_SIMULATOR if simulate else port
 
         self.scenes = [cls() for cls in SCENE_CLASSES]
@@ -118,6 +209,8 @@ class MainWindow(QMainWindow):
 
         self._start_worker()
         self._build_ui()
+        self.tray = TrayController(self)
+        self.tray.set_enabled(self.tray_enabled and not self.service_mode)
         self._refresh_ports()
         self._update_connection_ui()
 
@@ -129,9 +222,9 @@ class MainWindow(QMainWindow):
         self._tick()
 
         geometry = s.value("window/geometry")
-        if geometry is not None:
+        if geometry is not None and not self.service_mode:
             self.restoreGeometry(geometry)
-        if self._startup_port or s.value("connection/auto_connect", True, type=bool):
+        if self._startup_port or self.service_mode or s.value("connection/auto_connect", True, type=bool):
             QTimer.singleShot(400, self._auto_connect)
 
     # ------------------------------------------------------------------ worker
@@ -164,17 +257,19 @@ class MainWindow(QMainWindow):
         self.connect_btn = QPushButton("Conectar")
         self.connect_btn.setProperty("primary", True)
         self.connect_btn.setMinimumHeight(38)
-        self.connect_btn.clicked.connect(self._toggle_connection)
+        self.connect_btn.clicked.connect(self.toggle_connection)
         for w in (title, self.preview, self.status_label, self.stats_label, self.connect_btn):
             left.add(w, 1 if w is self.preview else 0)
         layout.addWidget(left)
 
         # direita: abas
-        tabs = QTabWidget()
-        tabs.addTab(self._content_page(), "Conteúdo")
-        tabs.addTab(self._display_page(), "Tela")
-        tabs.addTab(self._connection_page(), "Conexão")
-        layout.addWidget(tabs, 1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._content_page(), "Conteúdo")
+        self.tabs.addTab(_scrollable(self._display_page()), "Tela")
+        self._system_tab_index = self.tabs.addTab(_scrollable(self._system_page()), "Sistema")
+        self.tabs.addTab(self._connection_page(), "Conexão")
+        self.tabs.currentChanged.connect(self._tab_changed)
+        layout.addWidget(self.tabs, 1)
 
     def _content_page(self) -> QWidget:
         page = QWidget()
@@ -184,17 +279,17 @@ class MainWindow(QMainWindow):
 
         seg = QHBoxLayout()
         seg.setSpacing(8)
-        group = QButtonGroup(self)
-        group.setExclusive(True)
+        self.scene_group = QButtonGroup(self)
+        self.scene_group.setExclusive(True)
         for i, sc in enumerate(self.scenes):
             b = QPushButton(sc.title)
             b.setCheckable(True)
             b.setProperty("seg", True)
             b.setChecked(i == self.scene_index)
-            group.addButton(b, i)
+            self.scene_group.addButton(b, i)
             seg.addWidget(b)
         seg.addStretch(1)
-        group.idClicked.connect(self._select_scene)
+        self.scene_group.idClicked.connect(self._select_scene)
         v.addLayout(seg)
 
         card = Card("Ajustes")
@@ -215,9 +310,9 @@ class MainWindow(QMainWindow):
         return page
 
     def _display_page(self) -> QWidget:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.setContentsMargins(0, 6, 0, 0)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(0, 6, 12, 6)
         v.setSpacing(14)
 
         bright = Card("Brilho")
@@ -225,6 +320,7 @@ class MainWindow(QMainWindow):
         self._brightness_timer = QTimer(self, singleShot=True, interval=150, timeout=self._send_brightness)
         self.brightness_row.valueChanged.connect(self._set_brightness)
         bright.add(self.brightness_row)
+        bright.add(_label("Brilho de dia. Com o modo noturno ativo, na janela de horário vale o brilho definido nele.", "muted"))
         v.addWidget(bright)
 
         orient = Card("Orientação")
@@ -237,12 +333,74 @@ class MainWindow(QMainWindow):
         orient.add(_label("Dica: use a cena “Teste › Orientação” para conferir se o canto A (vermelho) fica em cima à esquerda.", "muted"))
         v.addWidget(orient)
 
+        look = Card("Aparência")
+        look.add(_label("Calor da cor (luz noturna): tinge a imagem de âmbar e cansa menos a vista no escuro.", "muted"))
+        self.warmth_row = SliderRow(0, 100, self.warmth, " %")
+        self.warmth_row.valueChanged.connect(self._set_warmth)
+        look.add(self.warmth_row)
+        self.mirror_h_check = _checkbox("Espelhar na horizontal", self.mirror_h, self._set_mirror_h)
+        self.mirror_v_check = _checkbox("Espelhar na vertical", self.mirror_v, self._set_mirror_v)
+        look.add(self.mirror_h_check)
+        look.add(self.mirror_v_check)
+        v.addWidget(look)
+
+        night = Card("Modo noturno")
+        self.night_check = _checkbox("Ativar no horário abaixo", self.night_enabled, self._set_night_enabled)
+        night.add(self.night_check)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.night_start_edit = _time_edit(self.night_start, dtime(22, 0), self._set_night_times)
+        self.night_end_edit = _time_edit(self.night_end, dtime(7, 0), self._set_night_times)
+        row.addWidget(QLabel("Das"))
+        row.addWidget(self.night_start_edit)
+        row.addWidget(QLabel("até"))
+        row.addWidget(self.night_end_edit)
+        row.addStretch(1)
+        night.add(row)
+        self.night_mode_combo = _combo(
+            [("dim", "Reduzir o brilho"), ("off", "Desligar a tela")], self.night_mode, self._set_night_mode
+        )
+        night.add(self.night_mode_combo)
+        self.night_brightness_row = SliderRow(0, 100, self.night_brightness, " %")
+        self.night_brightness_row.valueChanged.connect(self._set_night_brightness)
+        night.add(self.night_brightness_row)
+        self.night_status = _label("", "muted")
+        night.add(self.night_status)
+        v.addWidget(night)
+        self._refresh_night_ui()
+
+        rot = Card("Rotação de cenas")
+        self.carousel_check = _checkbox("Alternar entre as cenas marcadas", self.carousel_enabled, self._on_carousel_toggled)
+        rot.add(self.carousel_check)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.carousel_spin = QSpinBox()
+        self.carousel_spin.setRange(3, 600)
+        self.carousel_spin.setSuffix(" s")
+        self.carousel_spin.setValue(self.carousel_interval)
+        self.carousel_spin.valueChanged.connect(self._set_carousel_interval)
+        row.addWidget(QLabel("Trocar a cada"))
+        row.addWidget(self.carousel_spin)
+        row.addStretch(1)
+        rot.add(row)
+        scenes_row = QHBoxLayout()
+        scenes_row.setSpacing(14)
+        self.carousel_boxes: dict[str, QCheckBox] = {}
+        for sc in self.scenes:
+            box = _checkbox(sc.title, sc.key in self.carousel_keys, lambda on, k=sc.key: self._set_carousel_scene(k, on))
+            self.carousel_boxes[sc.key] = box
+            scenes_row.addWidget(box)
+        scenes_row.addStretch(1)
+        rot.add(scenes_row)
+        rot.add(_label(f"Ao editar uma cena em Conteúdo, a rotação pausa por {CAROUSEL_HOLD_SECONDS} s para você ver o resultado.", "muted"))
+        v.addWidget(rot)
+
         actions = Card("Ações")
         row = QHBoxLayout()
         row.setSpacing(8)
         for text, handler, danger in (
-            ("Ligar tela", lambda: self.worker.request("screen", True), False),
-            ("Desligar tela", lambda: self.worker.request("screen", False), False),
+            ("Ligar tela", lambda: self.screen_power(True), False),
+            ("Desligar tela", lambda: self.screen_power(False), False),
             ("Limpar tela", lambda: self.worker.request("clear"), False),
             ("Reiniciar display…", self._confirm_reset, True),
         ):
@@ -255,20 +413,59 @@ class MainWindow(QMainWindow):
         v.addWidget(actions)
 
         sending = Card("Envio")
-        self.send_check = QCheckBox("Enviar quadros ao display")
-        self.send_check.setChecked(True)
-        self.send_check.toggled.connect(self._set_send_enabled)
-        self.partial_check = QCheckBox("Atualização parcial (envia só o que mudou)")
-        self.partial_check.setChecked(self.partial)
-        self.partial_check.toggled.connect(self._set_partial)
-        self.invert_check = QCheckBox("Inverter a escala do brilho (se o controle funcionar ao contrário)")
-        self.invert_check.setChecked(self.invert_brightness)
-        self.invert_check.toggled.connect(self._set_invert_brightness)
+        self.send_check = _checkbox("Enviar quadros ao display", True, self._set_send_enabled)
+        self.partial_check = _checkbox("Atualização parcial (envia só o que mudou)", self.partial, self._set_partial)
+        self.invert_check = _checkbox(
+            "Inverter a escala do brilho (se o controle funcionar ao contrário)", self.invert_brightness, self._set_invert_brightness
+        )
         for c in (self.send_check, self.partial_check, self.invert_check):
             sending.add(c)
         v.addWidget(sending)
+
+        leaving = Card("Ao sair do aplicativo")
+        self.exit_combo = _combo(EXIT_OPTIONS, self.exit_action, self._set_exit_action)
+        leaving.add(self.exit_combo)
+        leaving.add(_label("Com o serviço em segundo plano ativo, ele assume o display logo depois que você fecha a janela.", "muted"))
+        v.addWidget(leaving)
         v.addStretch(1)
-        return page
+        return body
+
+    def _system_page(self) -> QWidget:
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(0, 6, 12, 6)
+        v.setSpacing(14)
+
+        start = Card("Iniciar com o sistema")
+        self.autostart_combo = _combo(AUTOSTART_OPTIONS, "off", self._on_autostart_changed)
+        start.add(self.autostart_combo)
+        self.autostart_status = _label("Consultando…", "muted")
+        start.add(self.autostart_status)
+        self.linger_check = _checkbox("Iniciar já no boot, antes de fazer login (linger)", False, self._on_linger_toggled)
+        self.linger_check.setEnabled(False)
+        start.add(self.linger_check)
+        self.service_hint = _label(
+            "Sem uma sessão aberta, o acesso à porta serial depende do grupo “dialout”: "
+            "rode  sudo usermod -aG dialout $USER  e faça login de novo. "
+            "O serviço começa a valer no próximo login (ou boot, com linger) e logo depois que você fechar esta janela.",
+            "hint",
+        )
+        self.service_hint.hide()
+        start.add(self.service_hint)
+        v.addWidget(start)
+
+        tray = Card("Bandeja do sistema")
+        self.tray_check = _checkbox("Mostrar o ícone na bandeja", self.tray_enabled, self._set_tray_enabled)
+        self.close_tray_check = _checkbox(
+            "Fechar a janela mantém o aplicativo rodando na bandeja", self.close_to_tray, self._set_close_to_tray
+        )
+        self.tray_status = _label("", "muted")
+        for w in (self.tray_check, self.close_tray_check, self.tray_status):
+            tray.add(w)
+        v.addWidget(tray)
+        self._refresh_tray_ui()
+        v.addStretch(1)
+        return body
 
     def _connection_page(self) -> QWidget:
         page = QWidget()
@@ -311,10 +508,23 @@ class MainWindow(QMainWindow):
         return page
 
     # ------------------------------------------------------------ render loop
+    def displayed_scene_index(self) -> int:
+        """Cena que está de fato no display: a escolhida, ou a da vez na rotação."""
+        now = _time.monotonic()
+        if self.carousel_enabled and now >= self._carousel_hold_until:
+            picked = [i for i, sc in enumerate(self.scenes) if sc.key in self.carousel_keys]
+            return carousel_pick(picked, now - self._carousel_t0, self.carousel_interval, self.scene_index)
+        return self.scene_index
+
     def _tick(self) -> None:
+        if self.service_mode and not (self._connected and self.send_enabled):
+            return  # sem janela e sem display: nada para desenhar
+        now = self._now()
+        self._apply_night()
         w, h = oriented_size(self.orientation)
-        ctx = RenderContext(self.stats, datetime.now(), self.orientation)
-        image = self.scenes[self.scene_index].render(QSize(w, h), ctx)
+        ctx = RenderContext(self.stats, now, self.orientation)
+        image = self.scenes[self.displayed_scene_index()].render(QSize(w, h), ctx)
+        image = postfx.apply_effects(image, self.warmth, self.mirror_h, self.mirror_v)
         self.preview.set_frame(image)
         if self._connected and self.send_enabled:
             self.worker.push_frame(image)
@@ -323,27 +533,70 @@ class MainWindow(QMainWindow):
         sc = self.sender()
         if sc is not None and hasattr(sc, "key"):
             self.settings.setValue(f"scenes/{sc.key}", json.dumps(sc.dump()))
+        self._hold_carousel()
         self._tick()
 
     def _select_scene(self, index: int) -> None:
         self.scene_index = index
         self.stack.setCurrentIndex(index)
+        button = self.scene_group.button(index)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
         self.settings.setValue("content/scene", index)
+        self._hold_carousel()
         self._tick()
+
+    def select_scene_explicit(self, index: int) -> None:
+        """Escolha deliberada (bandeja): vale mais que a rotação, que é desligada."""
+        if self.carousel_check.isChecked():
+            self.carousel_check.setChecked(False)
+        self._select_scene(index)
 
     def _set_fps(self, fps: int) -> None:
         self.fps = fps
         self.render_timer.setInterval(max(100, 1000 // fps))
         self.settings.setValue("content/fps", fps)
 
+    # ---------------------------------------------------------------- rotação
+    def _hold_carousel(self) -> None:
+        self._carousel_hold_until = _time.monotonic() + CAROUSEL_HOLD_SECONDS
+        self._carousel_t0 = self._carousel_hold_until  # depois da pausa, recomeça pela primeira cena
+
+    def _on_carousel_toggled(self, on: bool) -> None:
+        self.carousel_enabled = on
+        self.settings.setValue("carousel/enabled", on)
+        self._carousel_hold_until = 0.0
+        self._carousel_t0 = _time.monotonic()
+        self._tick()
+
+    def set_carousel(self, on: bool) -> None:
+        self.carousel_check.setChecked(on)
+
+    def _set_carousel_interval(self, seconds: int) -> None:
+        self.carousel_interval = seconds
+        self.settings.setValue("carousel/interval", seconds)
+
+    def _set_carousel_scene(self, key: str, on: bool) -> None:
+        keys = [k for k in self.carousel_keys if k != key]
+        if on:
+            keys.append(key)
+        self.carousel_keys = [sc.key for sc in self.scenes if sc.key in keys]  # mantém a ordem das abas
+        self.settings.setValue("carousel/scenes", ",".join(self.carousel_keys))
+
     # ------------------------------------------------------------ tela / brilho
+    def effective_brightness(self) -> int:
+        return self.night_brightness if self._night_state == "dim" else self.brightness
+
     def _set_brightness(self, level: int) -> None:
         self.brightness = level
         self.settings.setValue("display/brightness", level)
         self._brightness_timer.start()
 
+    def set_brightness_percent(self, level: int) -> None:
+        self.brightness_row.setValue(level)
+
     def _send_brightness(self) -> None:
-        self.worker.request("brightness", self.brightness)
+        self.worker.request("brightness", self.effective_brightness())
 
     def _set_orientation(self) -> None:
         self.orientation = Orientation(self.orientation_combo.currentData())
@@ -365,7 +618,14 @@ class MainWindow(QMainWindow):
     def _set_invert_brightness(self, on: bool) -> None:
         self.invert_brightness = on
         self.settings.setValue("display/invert_brightness", on)
-        self.worker.request("invert_brightness", {"invert": on, "level": self.brightness})
+        self.worker.request("invert_brightness", {"invert": on, "level": self.effective_brightness()})
+
+    def screen_power(self, on: bool) -> None:
+        self.worker.request("screen", on)
+
+    def _set_exit_action(self) -> None:
+        self.exit_action = self.exit_combo.currentData()
+        self.settings.setValue("exit/action", self.exit_action)
 
     def _confirm_reset(self) -> None:
         if not self._connected:
@@ -377,6 +637,87 @@ class MainWindow(QMainWindow):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.worker.request("reset", self._state_args())
+
+    # ---------------------------------------------------------------- aparência
+    def _set_warmth(self, value: int) -> None:
+        self.warmth = value
+        self.settings.setValue("display/warmth", value)
+        self._tick()
+
+    def _set_mirror_h(self, on: bool) -> None:
+        self.mirror_h = on
+        self.settings.setValue("display/mirror_h", on)
+        self._tick()
+
+    def _set_mirror_v(self, on: bool) -> None:
+        self.mirror_v = on
+        self.settings.setValue("display/mirror_v", on)
+        self._tick()
+
+    # ------------------------------------------------------------ modo noturno
+    def _compute_night_state(self) -> str:
+        if not self.night_enabled:
+            return "day"
+        now = self._now().time()
+        start = parse_hhmm(self.night_start, dtime(22, 0))
+        end = parse_hhmm(self.night_end, dtime(7, 0))
+        if not night_active(now, start, end):
+            return "day"
+        return "off" if self.night_mode == "off" else "dim"
+
+    def _apply_night(self, force: bool = False) -> None:
+        """Envia ao aparelho só o que mudou na transição dia → noite → dia."""
+        state = self._compute_night_state()
+        changed = state != self._night_state
+        previous, self._night_state = self._night_state, state
+        if not self._connected or not (changed or force):
+            return
+        if state == "off":
+            self.worker.request("screen", False)
+            return
+        if changed and previous == "off":
+            self.worker.request("screen", True)
+        if changed:
+            self.worker.request("brightness", self.effective_brightness())
+
+    def _refresh_night_ui(self) -> None:
+        dim = self.night_mode == "dim"
+        self.night_brightness_row.setEnabled(dim)
+        state = self._compute_night_state()
+        self.night_status.setText(
+            {
+                "day": "Fora do horário noturno agora." if self.night_enabled else "Desativado.",
+                "dim": "Modo noturno ativo agora: brilho reduzido.",
+                "off": "Modo noturno ativo agora: tela desligada.",
+            }[state]
+        )
+
+    def _set_night_enabled(self, on: bool) -> None:
+        self.night_enabled = on
+        self.settings.setValue("night/enabled", on)
+        self._night_changed()
+
+    def _set_night_times(self) -> None:
+        self.night_start = self.night_start_edit.time().toString("HH:mm")
+        self.night_end = self.night_end_edit.time().toString("HH:mm")
+        self.settings.setValue("night/start", self.night_start)
+        self.settings.setValue("night/end", self.night_end)
+        self._night_changed()
+
+    def _set_night_mode(self) -> None:
+        self.night_mode = self.night_mode_combo.currentData()
+        self.settings.setValue("night/mode", self.night_mode)
+        self._night_changed()
+
+    def _set_night_brightness(self, level: int) -> None:
+        self.night_brightness = level
+        self.settings.setValue("night/brightness", level)
+        if self._night_state == "dim":
+            self._brightness_timer.start()
+
+    def _night_changed(self) -> None:
+        self._apply_night()
+        self._refresh_night_ui()
 
     # ----------------------------------------------------------------- conexão
     def _refresh_ports(self) -> None:
@@ -398,20 +739,30 @@ class MainWindow(QMainWindow):
         self.port_combo.blockSignals(False)
 
     def _state_args(self) -> dict:
+        night = self._compute_night_state()
         return {
             "port": self.port_combo.currentData() or PORT_AUTO,
             "orientation": int(self.orientation),
-            "brightness": self.brightness,
+            "brightness": self.night_brightness if night == "dim" else self.brightness,
             "partial": self.partial,
             "invert_brightness": self.invert_brightness,
         }
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def wants_connection(self) -> bool:
+        return self._connected or self._want_connected
+
+    def _reconnect_enabled(self) -> bool:
+        return self.service_mode or self.reconnect_check.isChecked()
 
     def _auto_connect(self) -> None:
         self._want_connected = True
         self._request_connect()
 
-    def _toggle_connection(self) -> None:
-        if self._connected or self._want_connected:
+    def toggle_connection(self) -> None:
+        if self.wants_connection():
             self._want_connected = False
             self.worker.request("disconnect")
             self._connecting = False
@@ -427,18 +778,19 @@ class MainWindow(QMainWindow):
         self._update_connection_ui()
 
     def _maybe_reconnect(self) -> None:
-        if self._want_connected and not self._connected and not self._connecting and self.reconnect_check.isChecked():
+        if self._want_connected and not self._connected and not self._connecting and self._reconnect_enabled():
             self._request_connect()
 
     def _on_connection_changed(self, ok: bool, text: str) -> None:
         self._connected = ok
         self._connecting = False
         self._info = text
-        if not ok and not self.reconnect_check.isChecked():
+        if not ok and not self._reconnect_enabled():
             self._want_connected = False
         self.hint_label.setVisible("udev" in text)
         self._update_connection_ui(error=None if ok or text == "Desconectado" else text)
         if ok:
+            self._apply_night(force=True)  # o aparelho acabou de ligar: reaplica "tela desligada" se for o caso
             self._tick()
 
     def _on_stats(self, fps: float, kib: float, ms: float) -> None:
@@ -446,22 +798,23 @@ class MainWindow(QMainWindow):
 
     def _update_connection_ui(self, error: str | None = None) -> None:
         if self._connected:
-            dot, text = DOT["ok"], f"Conectado — {getattr(self, '_info', '')}"
+            state, text = "ok", f"Conectado — {self._info}"
         elif self._connecting or self._want_connected:
-            dot, text = DOT["wait"], "Procurando o display…" if not error else f"Aguardando — {error}"
+            state, text = "wait", "Procurando o display…" if not error else f"Aguardando — {error}"
         elif error:
-            dot, text = DOT["err"], error
+            state, text = "err", error
         else:
-            dot, text = DOT["off"], "Desconectado"
-        self.status_label.setText(f'<span style="color:{dot}; font-size:16px;">●</span>&nbsp; {text}')
-        self.connect_btn.setText("Desconectar" if (self._connected or self._want_connected) else "Conectar")
+            state, text = "off", "Desconectado"
+        self.status_label.setText(f'<span style="color:{STATUS_COLORS[state]}; font-size:16px;">●</span>&nbsp; {text}')
+        self.connect_btn.setText("Desconectar" if self.wants_connection() else "Conectar")
         if not self._connected:
             self.stats_label.setText("")
         self.info_label.setText(
             "Os quadros só são enviados enquanto estiver conectado. A pré-visualização funciona sempre."
             if not self._connected
-            else f"Resolução do painel: {oriented_size(self.orientation)[0]}×{oriented_size(self.orientation)[1]} · {getattr(self, '_info', '')}"
+            else f"Resolução do painel: {oriented_size(self.orientation)[0]}×{oriented_size(self.orientation)[1]} · {self._info}"
         )
+        self.tray.update_state(state, f"35inch-qt — {text}")
 
     def _log(self, message: str) -> None:
         if message == self._last_log:
@@ -469,15 +822,120 @@ class MainWindow(QMainWindow):
         self._last_log = message
         self.log_view.appendPlainText(f"{datetime.now():%H:%M:%S}  {message}")
 
+    # ----------------------------------------------------- iniciar com o sistema
+    def _tab_changed(self, index: int) -> None:
+        if index == self._system_tab_index and not self._autostart_loaded:
+            self.refresh_autostart_ui()  # consulta o systemd só quando a aba é aberta
+
+    def refresh_autostart_ui(self) -> None:
+        st = autostart.status(self.autostart_runner)
+        self._autostart_loaded = True
+        self._autostart_mode = st.mode
+        _select_silently(self.autostart_combo, st.mode)
+        item = self.autostart_combo.model().item(self.autostart_combo.findData("service"))
+        item.setEnabled(st.systemd_available or st.mode == "service")
+        self.linger_check.blockSignals(True)
+        self.linger_check.setChecked(bool(st.linger))
+        self.linger_check.blockSignals(False)
+        self.linger_check.setEnabled(st.mode == "service" and st.linger is not None)
+        self.service_hint.setVisible(st.mode == "service")
+        note = "" if st.systemd_available else " (o systemd de usuário não está disponível nesta sessão)"
+        self.autostart_status.setText(AUTOSTART_TEXT[st.mode] + note)
+
+    def _on_autostart_changed(self) -> None:
+        mode = self.autostart_combo.currentData()
+        try:
+            message = autostart.set_mode(mode, self.autostart_runner)
+        except autostart.AutostartError as exc:
+            _select_silently(self.autostart_combo, self._autostart_mode)
+            self.autostart_status.setText(f"⚠ {exc}")
+            self._log(str(exc))
+            return
+        self._log(message)
+        self.refresh_autostart_ui()
+        self.autostart_status.setText(message)
+
+    def _on_linger_toggled(self, on: bool) -> None:
+        try:
+            autostart.set_linger(on, self.autostart_runner)
+        except autostart.AutostartError as exc:
+            self.linger_check.blockSignals(True)
+            self.linger_check.setChecked(not on)
+            self.linger_check.blockSignals(False)
+            self.autostart_status.setText(f"⚠ {exc}")
+            self._log(str(exc))
+            return
+        self._log("Linger ativado: o serviço sobe no boot." if on else "Linger desativado.")
+
+    # ------------------------------------------------------------------ bandeja
+    def _refresh_tray_ui(self) -> None:
+        self.close_tray_check.setEnabled(self.tray_enabled)
+        self.tray_status.setText(
+            "A bandeja está disponível neste ambiente."
+            if TrayController.available()  # estático: a bandeja ainda nem foi criada quando a página é montada
+            else "A bandeja não está disponível neste ambiente. No GNOME, instale a extensão "
+            "“AppIndicator and KStatusNotifierItem Support”; sem ela, fechar a janela encerra o programa."
+        )
+
+    def _set_tray_enabled(self, on: bool) -> None:
+        self.tray_enabled = on
+        self.settings.setValue("system/tray_enabled", on)
+        self.tray.set_enabled(on and not self.service_mode)
+        self.close_tray_check.setEnabled(on)
+        self.tray.refresh()
+
+    def _set_close_to_tray(self, on: bool) -> None:
+        self.close_to_tray = on
+        self.settings.setValue("system/close_to_tray", on)
+
+    def show_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_window(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_window()
+        self.tray.refresh()
+
     # ------------------------------------------------------------------ fechar
-    def closeEvent(self, event) -> None:  # noqa: N802
-        s = self.settings
-        s.setValue("window/geometry", self.saveGeometry())
-        s.setValue("connection/auto_connect", self.auto_check.isChecked())
-        s.setValue("connection/auto_reconnect", self.reconnect_check.isChecked())
-        for t in (self.render_timer, self.stats_timer, self.reconnect_timer):
+    def shutdown(self) -> None:
+        """Salva o estado e para a thread de E/S. Pode ser chamado mais de uma vez."""
+        if self._shut:
+            return
+        self._shut = True
+        if not self.service_mode:  # o serviço não pode sobrescrever o que a janela guardou
+            s = self.settings
+            s.setValue("window/geometry", self.saveGeometry())
+            s.setValue("connection/auto_connect", self.auto_check.isChecked())
+            s.setValue("connection/auto_reconnect", self.reconnect_check.isChecked())
+        for t in (self.render_timer, self.stats_timer, self.reconnect_timer, self._brightness_timer):
             t.stop()
+        self.worker.exit_action = self.exit_action
         QMetaObject.invokeMethod(self.worker, "shutdown", Qt.ConnectionType.BlockingQueuedConnection)
         self.worker_thread.quit()
         self.worker_thread.wait(3000)
+        self.tray.set_enabled(False)
+
+    def quit_app(self) -> None:
+        """Encerramento de verdade (menu da bandeja, SIGTERM, outra instância pedindo o display)."""
+        self._quitting = True
+        self.shutdown()
+        if self.quit_on_close:
+            QApplication.quit()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if not self._quitting and self.close_to_tray and self.tray.active():
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.notify("35inch-qt continua em execução", "Use o ícone da bandeja para abrir a janela ou sair.")
+            self.tray.refresh()
+            return
+        self.shutdown()
+        if self.quit_on_close:
+            QApplication.quit()
         super().closeEvent(event)

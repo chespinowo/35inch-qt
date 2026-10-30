@@ -39,6 +39,7 @@ class DisplayWorker(QObject):
         self._window: deque[tuple[float, int]] = deque()
         self._last_stats_emit = 0.0
         self.is_connected = False  # lido pela UI; escrito só nesta thread
+        self.exit_action = "keep"  # "keep" | "clear" | "off": o que fazer com a tela ao encerrar
         self._kick.connect(self._process, Qt.ConnectionType.QueuedConnection)
         self._command.connect(self._run_command, Qt.ConnectionType.QueuedConnection)
 
@@ -59,6 +60,14 @@ class DisplayWorker(QObject):
     @Slot()
     def shutdown(self) -> None:
         """Chamado com BlockingQueuedConnection ao fechar a janela."""
+        if self._display is not None and self.is_connected:
+            try:
+                if self.exit_action == "clear":
+                    self._display.clear()
+                elif self.exit_action == "off":
+                    self._display.screen_off()
+            except DisplayError:
+                pass  # saindo de qualquer jeito; o aparelho pode já ter sido desconectado
         self._disconnect(quiet=True)
 
     # ---- execução na thread do worker ----------------------------------

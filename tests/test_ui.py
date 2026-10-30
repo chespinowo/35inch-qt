@@ -104,10 +104,10 @@ def test_brightness_and_screen_commands_reach_the_display(window):
 
 
 def test_disconnect_and_reconnect(window):
-    window._toggle_connection()
+    window.toggle_connection()
     assert wait_for(lambda: not window._connected)
     assert window.connect_btn.text() == "Conectar"
-    window._toggle_connection()
+    window.toggle_connection()
     assert wait_for(lambda: window._connected)
     assert window.connect_btn.text() == "Desconectar"
 

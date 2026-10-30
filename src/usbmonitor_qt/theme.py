@@ -36,12 +36,22 @@ QPushButton[primary="true"]:disabled { background: #1e4a5e; border-color: #1e4a5
 QPushButton[seg="true"]:checked { background: @ACCENT_DIM@; border-color: @ACCENT@; font-weight: 600; }
 QPushButton[danger="true"] { color: #fca5a5; }
 
-QComboBox, QLineEdit, QSpinBox, QPlainTextEdit {
+QComboBox, QLineEdit, QSpinBox, QTimeEdit, QPlainTextEdit {
     background: #10151c; border: 1px solid #2b3544; border-radius: 8px; padding: 6px 9px;
     selection-background-color: @ACCENT_DIM@;
 }
-QComboBox:hover, QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus { border-color: @ACCENT@; }
+QComboBox:hover, QLineEdit:focus, QSpinBox:focus, QTimeEdit:focus, QPlainTextEdit:focus { border-color: @ACCENT@; }
 QComboBox QAbstractItemView { background: #151a22; border: 1px solid #2b3544; selection-background-color: @ACCENT_DIM@; outline: 0; }
+QComboBox QAbstractItemView::item:disabled { color: #5b6676; }
+
+QMenu { background: #151a22; border: 1px solid #2b3544; border-radius: 10px; padding: 6px; }
+QMenu::item { padding: 7px 24px 7px 14px; border-radius: 6px; }
+QMenu::item:selected { background: @ACCENT_DIM@; }
+QMenu::item:disabled { color: #5b6676; }
+QMenu::separator { height: 1px; background: #2b3544; margin: 5px 8px; }
+QMenu::indicator { width: 14px; height: 14px; margin-left: 4px; }
+
+QScrollArea { border: 0; background: transparent; }
 
 QCheckBox { spacing: 9px; }
 QCheckBox::indicator { width: 18px; height: 18px; border-radius: 5px; border: 1px solid #3a475a; background: #10151c; }
@@ -76,7 +86,11 @@ def stylesheet(accent: str = ACCENT) -> str:
     )
 
 
-def app_icon() -> QIcon:
+STATUS_COLORS = {"ok": "#34d399", "wait": "#fbbf24", "off": "#6b7686", "err": "#f87171"}
+
+
+def app_icon(status: str | None = None) -> QIcon:
+    """Ícone do aplicativo; com `status` ("ok", "wait", "off", "err") ganha um ponto colorido no canto."""
     icon = QIcon()
     for size in (32, 64, 128, 256):
         pm = QPixmap(size, size)
@@ -95,6 +109,12 @@ def app_icon() -> QIcon:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(grad)
         p.drawRoundedRect(screen, s * 0.05, s * 0.05)
+        if status in STATUS_COLORS:
+            r = s * 0.17
+            c = QRectF(s - r * 2 - s * 0.02, s - r * 2 - s * 0.02, r * 2, r * 2)
+            p.setPen(QPen(QColor("#0b0e13"), max(1.5, s * 0.05)))
+            p.setBrush(QColor(STATUS_COLORS[status]))
+            p.drawEllipse(c)
         p.end()
         icon.addPixmap(pm)
     return icon
