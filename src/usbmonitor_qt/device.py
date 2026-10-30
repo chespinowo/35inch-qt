@@ -29,7 +29,7 @@ PORT_AUTO = "AUTO"
 PORT_SIMULATOR = "SIM"
 
 PERMISSION_HINT = (
-    "Sem permissão para abrir {port}. Instale a regra udev (udev/99-usbmonitor.rules) "
+    "Sem permissão para abrir {port}. Instale a regra udev (udev/60-usbmonitor.rules) "
     "e replugue o display, ou adicione seu usuário ao grupo 'dialout'."
 )
 

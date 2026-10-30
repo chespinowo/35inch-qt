@@ -295,7 +295,7 @@ class MainWindow(QMainWindow):
         dev.add(self.info_label)
         self.hint_label = _label(
             "Sem permissão na porta serial. Instale a regra udev que acompanha o projeto "
-            "(udev/99-usbmonitor.rules), replugue o display ou adicione seu usuário ao grupo “dialout”.",
+            "(udev/60-usbmonitor.rules), replugue o display ou adicione seu usuário ao grupo “dialout”.",
             "hint",
         )
         self.hint_label.hide()

@@ -44,12 +44,25 @@ Requer Python 3.10+. Em algumas distribuições o Qt precisa de `libxcb-cursor0`
 ### Permissão na porta serial (uma vez)
 
 ```bash
-sudo cp udev/99-usbmonitor.rules /etc/udev/rules.d/
+sudo cp udev/60-usbmonitor.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 Depois desconecte e conecte o display. A regra também impede o ModemManager de "sondar" o aparelho. Alternativa:
-`sudo usermod -aG dialout $USER` e relogar.
+`sudo usermod -aG dialout $USER` e **sair e entrar na sessão** (o grupo novo só vale em logins novos).
+
+### "Sem permissão para abrir /dev/ttyACM0"
+
+```bash
+ls -l /dev/ttyACM0     # dono/grupo e permissões da porta
+id -nG                 # seus grupos: "dialout" (Debian/Ubuntu) ou "uucp" (Arch/Fedora) deveria aparecer
+getfacl /dev/ttyACM0   # com a regra udev ativa, deve haver "user:SEU_USUARIO:rw-"
+```
+
+- A regra tem de se chamar `60-…` (antes de `73-seat-late.rules`); com prefixo maior a etiqueta `uaccess` não funciona.
+- Após instalar a regra é preciso **replugar** o display; `udevadm trigger` sozinho nem sempre reaplica a um aparelho já conectado.
+- Para testar na hora, sem instalar nada: `sudo setfacl -m u:$USER:rw /dev/ttyACM0` (vale até desconectar o cabo).
+- Em Arch/Fedora o grupo é `uucp`: ajuste `GROUP=` na regra e use `usermod -aG uucp`.
 
 ## Uso
 

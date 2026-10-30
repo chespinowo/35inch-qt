@@ -1,11 +1,15 @@
 # Acesso ao display USB de 3.5" "UsbMonitor" (QinHeng 1a86:5722) sem precisar de root.
 #
+# O nome começa com 60 DE PROPÓSITO: a etiqueta "uaccess" só tem efeito se a regra
+# rodar antes de 73-seat-late.rules. Com um prefixo maior (ex.: 99-) ela é ignorada.
+#
 # Instalação:
-#   sudo cp udev/99-usbmonitor.rules /etc/udev/rules.d/
+#   sudo cp udev/60-usbmonitor.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload && sudo udevadm trigger
 # Depois, desconecte e conecte o display de novo.
 
-# Dá acesso ao usuário logado (uaccess) e ao grupo "dialout"
+# Acesso imediato ao usuário da sessão gráfica (uaccess) e ao grupo "dialout"
+# (em Arch/Fedora o grupo das portas seriais é "uucp": troque GROUP se for o seu caso)
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5722", TAG+="uaccess", MODE="0660", GROUP="dialout"
 
 # Impede o ModemManager de "sondar" o display como se fosse um modem
